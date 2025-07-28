@@ -19,6 +19,7 @@ from itertools import product
 # import scripts
 from DDPM.Diffusion import Diffusion
 from DDPM.Unet import UNet
+from VAE.VAE import VAE
 
 
 # Seed numpy
@@ -33,11 +34,14 @@ def argparser(args):
     model_eval = parser.add_argument_group()
     dataset_params = parser.add_argument_group()
 
-    model_selection.add_argument("--model", type=str, dest='model_sel', default='DDPM', help="Selection of Generative Model. Available options are: DDPM, GAN, LDM, EBM", required=True)
+    model_selection.add_argument("--model", type=str, dest='model_sel', default='DDPM', help="Selection of Generative Model. Available options are: DDPM, GAN, LDM, EBM, VAE", required=True)
 
     model_params.add_argument("--noise-steps", type=int, nargs='+', dest="noise_steps", default=[1000], help="Noise steps to be used in the DDPM forward and backward processes.")
     model_params.add_argument("--beta-start", type=float, nargs='+', dest="beta_start", default=[1e-4], help="Set the beta start parameter for DDPM")
     model_params.add_argument("--beta-end", type=float, nargs='+', default=[0.02], dest="beta_end", help="Set the beta end parameter for DDPM")
+    model_params.add_argument("--latent-dim", nargs='+', default=[100], type=int, dest="latent_dim", help="Selects latent dimension size. Required parameter for GANs")
+    model_params.add_argument("--hidden-dim", nargs='+', default=[200], type=int, dest="hidden_dim", help="Hidden dimension for VAEs")
+    model_params.add_argument("--z-dim", nargs='+', dest="z_dim", default=[20], type=int, help="Sets bottleneck dimension for VAEs")
 
     training_params.add_argument("--epochs", type=int, dest="epochs", default=100, help="Set the number of training iterations")
     training_params.add_argument("--batch-size", type=int, nargs='+', dest="batch_size", default=[32], help="Selects batch size for training.")
@@ -48,7 +52,7 @@ def argparser(args):
     training_params.add_argument("--model-output", type=str, required=True, dest="model_output_dir", help="Provide a directory to story your trained model.")
     training_params.add_argument("--verbose", "-v", dest='v', action='store_const', const=True, default=False, help="If given activates verbose mode.")
     training_params.add_argument("--random-seed", dest="random_seed", default=32, type=int, help="If provided np.random.seed is fixed to the given value. Default value is 32.")
-    training_params.add_argument("--latent-dim", nargs='+', default=[100], type=int, dest="latent_dim", help="Selects latent dimension size")
+    
 
     # TODO: enable give a path for train, test, val datasets
     dataset_params.add_argument("--MNIST", dest="MNIST", action='store_const', const=True, default=False, help="Selects MNIST dataset for training, validation, and test")
@@ -165,7 +169,7 @@ def train(epochs, train_loader, val_loader, test_dataset, model, optimizer, diff
 
     return fids, train_losses, val_losses
 
-def train_gan(epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, verbose, eval_method, eval_steps, eval_samples, batch_size):
+def train_gan(epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, verbose, eval, eval_steps, eval_samples, batch_size):
     train_losses = []
     val_losses = []
     fids = []
@@ -261,6 +265,73 @@ def train_gan(epochs, train_loader, val_loader, test_dataset, generator, discrim
     return fids, train_losses, []
 
 
+def train_vae(epochs, train_loader, val_loader, test_dataset, model, optimizer, device, loss_fn, verbose, eval, eval_steps, eval_samples, batch_size, img_size):
+    losses = []
+    fids = []
+
+    sample_dir = "data/eval_sampled"
+    test_dir = "data/eval_test"
+    os.makedirs(sample_dir, exist_ok=True)
+    os.makedirs(test_dir, exist_ok=True)
+
+    for epoch in tqdm(range(epochs)):
+        for x, _ in train_loader:
+            x = x.to(device)
+            x = x.view(x.size(0), img_size**2)
+            optimizer.zero_grad()
+            
+            out, mu, sigma = model(x)
+            reconstruction_loss = loss_fn(out, x)
+            #KL_div = -0.5 * torch.sum(1 + torch.log(sigma**2) - mu**2 - sigma**2, dim=1)
+            #KL_div = -0.5*torch.sum(1+torch.log(torch.pow(sigma, 2)) - torch.pow(mu, 2) - torch.pow(sigma, 2)) # Minimize KL_div
+            KL_div = -0.5 * torch.sum(1 + torch.log(sigma**2) - mu**2 - sigma**2, dim=1).mean()
+            
+            # backward
+            loss = reconstruction_loss + KL_div
+            loss.backward()
+            optimizer.step()
+            
+            losses.append(loss.item())
+        
+        print("Epoch {}/{} - Loss: {:.4f}".format(epoch+1, epochs, loss.item()))
+
+        if eval:
+            it = math.ceil(eval_samples/batch_size)
+            # Remove all existing elements from saved folders
+            for folder in [sample_dir, test_dir]:
+                for f in os.listdir(folder):
+                    os.remove(os.path.join(folder, f))
+            if epoch%eval_steps == 0:
+                with torch.no_grad():
+                    for j in range(it):
+                        z = torch.randn(batch_size, model.latent_dim, device=device)
+                        generated = model.decode(z).view(-1, 1, int(img_size**0.5), int(img_size**0.5))
+                        for i, img in enumerate(generated):
+                            if j * batch_size + i >= eval_samples:
+                                break
+                            save_image(img, os.path.join(sample_dir, f"{j*batch_size+i}.png"))
+                test_dl = torch.utils.data.DataLoader(test_dataset, batch_size=eval_samples, shuffle=True)
+                test_batch = next(iter(test_dl))[0][:eval_samples]
+                # Save sampled images and original images
+                for i, img in enumerate(test_batch):
+                    save_image(img, os.path.join(test_dir, f"{i}.png"))
+                # Calculate FID
+                fid_proc = subprocess.run(
+                    ["python", "-m", "pytorch_fid", sample_dir, test_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                fid_line = fid_proc.stdout.splitlines()[-1]
+                fid_value = float(fid_line.strip().split()[-1])
+                fids.append(fid_value)
+                if verbose:
+                    print(f"FID: {fid_value}")
+
+
+    return fids, losses, []
+
+
 
 def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -276,6 +347,13 @@ def main(args):
     elif args.model_sel == "GAN":
         param_grid = {
             'latent_dim' : args.latent_dim,
+            'batch_size' : args.batch_size,
+            'learning_rate' : args.lr
+        }
+    elif args.model_sel == "VAE":
+        param_grid = {
+            'hidden_dim' : args.hidden_dim,
+            'z_dim' : args.z_dim,
             'batch_size' : args.batch_size,
             'learning_rate' : args.lr
         }
@@ -352,6 +430,10 @@ def main(args):
         elif args.model_sel == "GAN":
             # Due to adversarial training, this implementation usses a separate training func
             pass
+        elif args.model_sel == "VAE":
+            hidden_dim = config['hidden_dim']
+            z_dim = config['z_dim']
+            model = VAE(input_dim=args.img_size**2, hidden_dim=hidden_dim, z_dim=z_dim).to(device)
         else:
             print("Given model is not available")
             raise
@@ -368,8 +450,10 @@ def main(args):
         # Init loss fn
         if args.loss == "MSE":
             loss_fn = nn.MSELoss()
-        elif args.loss == "BCE":
+        elif args.loss == "BCE" and args.model_sel=="GAN":
             loss_fn = nn.BCEWithLogitsLoss()
+        elif args.loss == "BCE" and args.model_sel=="VAE":
+            loss_fn = nn.BCELoss(reduction='sum')
         else:
             print("Given loss function is not available")
             raise
@@ -380,6 +464,8 @@ def main(args):
             beta_start = config['beta_start']
             beta_end = config['beta_end']
             diffusion = Diffusion(noise_steps=noise_steps, beta_start=beta_start, beta_end=beta_end, img_size=args.img_size, device=device)
+            fids, train_losses, val_losses = train(args.epochs, train_loader, val_loader, test_dataset, model, optimizer, diffusion, device, loss_fn, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
+
         elif args.model_sel == "GAN":
             from GAN.Generator import Generator
             from GAN.Discriminator import Discriminator
@@ -392,17 +478,15 @@ def main(args):
             opt_g = torch.optim.Adam(generator.parameters(), lr=learning_rate)
             opt_d = torch.optim.Adam(discriminator.parameters(), lr=learning_rate)
 
-            train_gan(args.epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
+            fids, train_losses, val_losses = train_gan(args.epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
 
-            # Save generator
-            timestamp = time.strftime('%b-%d-%Y_%H%M', time.localtime())
-            os.makedirs(args.model_output_dir, exist_ok=True)
-            torch.save(generator.state_dict(), os.path.join(args.model_output_dir, f'generator_{timestamp}.pt'))
+            model = generator
 
-            continue
+        elif args.model_sel == "VAE":
+            fids, train_losses, val_losses = train_vae(args.epochs, train_loader, val_loader, test_dataset, model, optimizer, device, loss_fn, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size, args.img_size)
 
         
-        fids, train_losses, val_losses = train(args.epochs, train_loader, val_loader, test_dataset, model, optimizer, diffusion, device, loss_fn, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
+        #fids, train_losses, val_losses = train(args.epochs, train_loader, val_loader, test_dataset, model, optimizer, diffusion, device, loss_fn, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
         
         # Save outputs
         t = time.localtime()
