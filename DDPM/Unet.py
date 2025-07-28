@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 
-from Up import Up
-from Down import Down
-from SelfAttention import SelfAttention
-from DoubleConv import DoubleConv
+from .Up import Up
+from .Down import Down
+from .SelfAttention import SelfAttention
+from .DoubleConv import DoubleConv
 
 class UNet(nn.Module):
     def __init__(self, c_in=1, c_out=1, time_dim=256, device=None):

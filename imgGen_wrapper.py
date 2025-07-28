@@ -11,13 +11,14 @@ import os
 import subprocess
 import math
 from torchvision.utils import save_image
+from torchvision.datasets import ImageFolder
 import pickle
 import time
 from itertools import product
 
 # import scripts
-from Diffusion import Diffusion
-from Unet import UNet
+from DDPM.Diffusion import Diffusion
+from DDPM.Unet import UNet
 
 
 # Seed numpy
@@ -54,6 +55,7 @@ def argparser(args):
     dataset_params.add_argument("--test-dataset", dest="test_dataset", default=None, type=str, help="Give the path for a folder to use as test dataset")
     dataset_params.add_argument("--val-dataset", dest="val_dataset", default=None, type=str, help="Give the path for a folder to use as validation dataset")
     dataset_params.add_argument("--img-size", dest="img_size", required=True, type=int, help="Provide the size of the images used for training and therefore generation size. Please use square images")
+    dataset_params.add_argument("--img-channels", dest="img_channels", type=int, default=1, help="If custom dataset, provide if your images are RGB or grayscale by indicating the number of channels.")
 
     # TODO: Add options for evaluation. E.g. FID
     model_eval.add_argument("--eval", dest="eval_method", default=None, type=str, help="Provide the evaluation method to be used once the model was trained. Available options: FID")
@@ -132,19 +134,11 @@ def train(epochs, train_loader, val_loader, test_dataset, model, optimizer, diff
                     for i, img in enumerate(sampled_images):
                         if j*batch_size+i >= eval_samples:
                             break
-                        # make it 3 channel - I noticed it doesn't make a difference in the FID score
-                        # img_tensor = img.squeeze(0)
-                        # if img_tensor.dim() == 2:
-                        #     img_tensor = img_tensor.expand(3,-1,-1)
                         save_image(img, os.path.join(sample_dir, f"{j*batch_size+i}.png"))
                 test_dl = torch.utils.data.DataLoader(test_dataset, batch_size=eval_samples, shuffle=True)
                 test_batch = next(iter(test_dl))[0][:eval_samples]
                 # Save sampled images and original images
                 for i, img in enumerate(test_batch):
-                    # make it 3 channel
-                    # img_tensor = img.squeeze(0)
-                    # if img_tensor.dim() == 2:
-                    #     img_tensor = img_tensor.expand(3,-1,-1)
                     save_image(img, os.path.join(test_dir, f"{i}.png"))
                 # Calculate FID
                 fid_proc = subprocess.run(
@@ -184,9 +178,6 @@ def main(args):
     keys, values = zip(*param_grid.items())
     runs = list(product(*values))
     for run_id, combo in enumerate(runs):
-        if run_id+1 <= 27:
-            print("Skipping config")
-            continue
         config = dict(zip(keys, combo))
         print(f"Running config {run_id+1}/{len(runs)}: {config}")
         
@@ -195,10 +186,6 @@ def main(args):
         beta_end = config['beta_end']
         batch_size = config['batch_size']
         learning_rate = config['learning_rate']
-
-        # Remove. I am only using this one to avoid repeating computations I already made.
-        if beta_start == 1e-4 and beta_end==0.02 and batch_size==32 and learning_rate==3e-4:
-            continue
 
         # Retrieve dataset
         if args.MNIST:
@@ -222,9 +209,34 @@ def main(args):
 
             print("MNIST dataset loaded")
 
-        # TODO
         elif args.train_dataset != None and args.test_dataset != None and args.val_dataset != None:
-            pass
+            from customDataset import customDataset
+            if args.img_channels==1:
+                transforms = torchvision.transforms.Compose([
+                    torchvision.transforms.Resize((args.img_size, args.img_size)),
+                    torchvision.transforms.ToTensor(),
+                    torchvision.transforms.Normalize((0.5,), (0.5,))  # For grayscale; change to (0.5, 0.5, 0.5) if RGB
+                ])
+            else:
+                transforms = torchvision.transforms.Compose([
+                    torchvision.transforms.Resize((args.img_size, args.img_size)),
+                    torchvision.transforms.ToTensor(),
+                    torchvision.transforms.Normalize((0.5,), (0.5,), (0.5))  # For grayscale; change to (0.5, 0.5, 0.5) if RGB
+                ])
+
+            fid_transform = torchvision.transforms.Compose([
+                torchvision.transforms.Resize((args.img_size, args.img_size)),
+                torchvision.transforms.ToTensor()
+            ])
+
+            train_dataset = customDataset(root_dir=args.train_dataset, transform=transforms, channels=args.img_channels)
+            val_dataset = customDataset(root_dir=args.val_dataset, transform=transforms, channels=args.img_channels)
+            test_dataset = customDataset(root_dir=args.test_dataset, transform=fid_transform, channels=args.img_channels)
+
+            train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+            print("Custom datasets loaded from provided paths.")
         
         else:
             print("Error retreiving train, test, and validation datasets. Please double check you provided a right path")
@@ -232,7 +244,7 @@ def main(args):
 
         # Init model
         if args.model_sel == "DDPM":
-            model = UNet(device=device).to(device)
+            model = UNet(device=device, c_in=args.img_channels, c_out=args.img_channels).to(device)
         elif args.model_sel == "LDM":
             pass
         else:
@@ -253,9 +265,6 @@ def main(args):
             print("Given loss function is not available")
             raise
 
-        
-
-
         # Init diffusion or any other model
         if args.model_sel == "DDPM":
             diffusion = Diffusion(noise_steps=noise_steps, beta_start=beta_start, beta_end=beta_end, img_size=args.img_size, device=device)
@@ -266,7 +275,8 @@ def main(args):
         # Save outputs
         t = time.localtime()
         timestamp = time.strftime('%b-%d-%Y_%H%M', t)
-        torch.save(model.state_dict(), args.model_output_dir+f'_{timestamp}')
+        os.makedirs(args.model_output_dir, exist_ok=True)
+        torch.save(model.state_dict(), os.path.join(args.model_output_dir, f'output_model_{timestamp}.pt'))
         out_dir = "data/temp"
         os.makedirs(out_dir, exist_ok=True)
         with open(out_dir+f'/train_losses_{timestamp}.pkl', 'wb') as f:
@@ -277,9 +287,6 @@ def main(args):
             with open(out_dir+f'/fids_{timestamp}.pkl', 'wb') as f:
                 pickle.dump(fids, f)
     
-
-
-
 
 if __name__ == "__main__":
     argsvalue = argparser(sys.argv[1:])
