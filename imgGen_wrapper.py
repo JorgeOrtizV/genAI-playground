@@ -48,6 +48,7 @@ def argparser(args):
     training_params.add_argument("--model-output", type=str, required=True, dest="model_output_dir", help="Provide a directory to story your trained model.")
     training_params.add_argument("--verbose", "-v", dest='v', action='store_const', const=True, default=False, help="If given activates verbose mode.")
     training_params.add_argument("--random-seed", dest="random_seed", default=32, type=int, help="If provided np.random.seed is fixed to the given value. Default value is 32.")
+    training_params.add_argument("--latent-dim", nargs='+', default=[100], type=int, dest="latent_dim", help="Selects latent dimension size")
 
     # TODO: enable give a path for train, test, val datasets
     dataset_params.add_argument("--MNIST", dest="MNIST", action='store_const', const=True, default=False, help="Selects MNIST dataset for training, validation, and test")
@@ -164,16 +165,120 @@ def train(epochs, train_loader, val_loader, test_dataset, model, optimizer, diff
 
     return fids, train_losses, val_losses
 
+def train_gan(epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, verbose, eval_method, eval_steps, eval_samples, batch_size):
+    train_losses = []
+    val_losses = []
+    fids = []
+
+    for epoch in tqdm(range(epochs)):
+        sample_dir = "data/eval_sampled"
+        test_dir = "data/eval_test"
+        os.makedirs(sample_dir, exist_ok=True)
+        os.makedirs(test_dir, exist_ok=True)
+
+        epoch_d_losses = []
+        epoch_g_losses = []
+
+        for x, _ in train_loader:
+            x_real = x.to(device)
+            batch_size = x_real.size(0)
+
+            # === Train Discriminator ===
+            opt_d.zero_grad()
+            y_real = torch.ones(batch_size, 1, device=device) * 0.9  # label smoothing
+            y_fake = torch.zeros(batch_size, 1, device=device)
+
+            # Real samples
+            prediction_real = discriminator(x_real)
+            loss_real = loss_fn(prediction_real, y_real)
+
+            # Fake samples
+            z = torch.randn(batch_size, latent_dim, device=device)
+            x_fake = generator(z)
+            prediction_fake = discriminator(x_fake.detach())
+            loss_fake = loss_fn(prediction_fake, y_fake)
+
+            loss_d = (loss_real + loss_fake) / 2
+            loss_d.backward()
+            opt_d.step()
+            epoch_d_losses.append(loss_d.item())
+
+            # === Train Generator ===
+            if epoch%2 == 0:
+                opt_g.zero_grad()
+                y_gen = torch.ones(batch_size, 1, device=device)
+                prediction = discriminator(x_fake)
+                loss_g = loss_fn(prediction, y_gen)
+                loss_g.backward()
+                opt_g.step()
+                epoch_g_losses.append(loss_g.item())
+
+        avg_d_loss = sum(epoch_d_losses) / len(epoch_d_losses)
+        avg_g_loss = sum(epoch_g_losses) / len(epoch_g_losses) if epoch_g_losses else 0.0
+        train_losses.append((avg_g_loss, avg_d_loss))
+
+
+        if eval:
+            it = math.ceil(eval_samples/batch_size)
+            # Remove all existing elements from saved folders
+            for folder in [sample_dir, test_dir]:
+                for f in os.listdir(folder):
+                    os.remove(os.path.join(folder, f))
+            if epoch%eval_steps == 0:
+                for j in range(it):
+                    z = torch.randn(batch_size, latent_dim, device=device)
+                    sampled_images = generator(z)
+                    for i, img in enumerate(sampled_images):
+                        if j*batch_size+i >= eval_samples:
+                            break
+                        save_image(img, os.path.join(sample_dir, f"{j*batch_size+i}.png"))
+                test_dl = torch.utils.data.DataLoader(test_dataset, batch_size=eval_samples, shuffle=True)
+                test_batch = next(iter(test_dl))[0][:eval_samples]
+                # Save sampled images and original images
+                for i, img in enumerate(test_batch):
+                    save_image(img, os.path.join(test_dir, f"{i}.png"))
+                # Calculate FID
+                fid_proc = subprocess.run(
+                    ["python", "-m", "pytorch_fid", sample_dir, test_dir],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                fid_line = fid_proc.stdout.splitlines()[-1]
+                fid_value = float(fid_line.strip().split()[-1])
+                fids.append(fid_value)
+                if verbose:
+                    print(f"FID: {fid_value}")
+
+        print(f"Epoch [{epoch+1}/{epochs}] | D Loss: {loss_d.item():.4f} | G Loss: {loss_g.item():.4f}")
+
+        if verbose and epoch % 5 == 0:
+            with torch.no_grad():
+                z = torch.randn(6, latent_dim, device=device)
+                generated_imgs = generator(z)
+                plot_images(generated_imgs)
+
+    return fids, train_losses, []
+
+
+
 def main(args):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    param_grid = {
-        'noise_steps' : args.noise_steps,
-        'beta_start' : args.beta_start,
-        'beta_end' : args.beta_end,
-        'batch_size' : args.batch_size,
-        'learning_rate' : args.lr
-    }
+    if args.model_sel == "DDPM":
+        param_grid = {
+            'noise_steps' : args.noise_steps,
+            'beta_start' : args.beta_start,
+            'beta_end' : args.beta_end,
+            'batch_size' : args.batch_size,
+            'learning_rate' : args.lr
+        }
+    elif args.model_sel == "GAN":
+        param_grid = {
+            'latent_dim' : args.latent_dim,
+            'batch_size' : args.batch_size,
+            'learning_rate' : args.lr
+        }
 
     keys, values = zip(*param_grid.items())
     runs = list(product(*values))
@@ -181,9 +286,6 @@ def main(args):
         config = dict(zip(keys, combo))
         print(f"Running config {run_id+1}/{len(runs)}: {config}")
         
-        noise_steps = config['noise_steps']
-        beta_start = config['beta_start']
-        beta_end = config['beta_end']
         batch_size = config['batch_size']
         learning_rate = config['learning_rate']
 
@@ -247,13 +349,18 @@ def main(args):
             model = UNet(device=device, c_in=args.img_channels, c_out=args.img_channels).to(device)
         elif args.model_sel == "LDM":
             pass
+        elif args.model_sel == "GAN":
+            # Due to adversarial training, this implementation usses a separate training func
+            pass
         else:
             print("Given model is not available")
             raise
 
         # Init opt
-        if args.opt == "Adam":
+        if args.opt == "Adam" and args.model_sel != "GAN":
             optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        elif args.model_sel == "GAN":
+            pass
         else:
             print("Given optimizer is not available")
             raise
@@ -261,13 +368,38 @@ def main(args):
         # Init loss fn
         if args.loss == "MSE":
             loss_fn = nn.MSELoss()
+        elif args.loss == "BCE":
+            loss_fn = nn.BCEWithLogitsLoss()
         else:
             print("Given loss function is not available")
             raise
 
         # Init diffusion or any other model
         if args.model_sel == "DDPM":
+            noise_steps = config['noise_steps']
+            beta_start = config['beta_start']
+            beta_end = config['beta_end']
             diffusion = Diffusion(noise_steps=noise_steps, beta_start=beta_start, beta_end=beta_end, img_size=args.img_size, device=device)
+        elif args.model_sel == "GAN":
+            from GAN.Generator import Generator
+            from GAN.Discriminator import Discriminator
+
+            latent_dim = config["latent_dim"]
+            
+            generator = Generator(latent_dim=latent_dim).to(device)
+            discriminator = Discriminator().to(device)
+
+            opt_g = torch.optim.Adam(generator.parameters(), lr=learning_rate)
+            opt_d = torch.optim.Adam(discriminator.parameters(), lr=learning_rate)
+
+            train_gan(args.epochs, train_loader, val_loader, test_dataset, generator, discriminator, opt_g, opt_d, device, loss_fn, latent_dim, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
+
+            # Save generator
+            timestamp = time.strftime('%b-%d-%Y_%H%M', time.localtime())
+            os.makedirs(args.model_output_dir, exist_ok=True)
+            torch.save(generator.state_dict(), os.path.join(args.model_output_dir, f'generator_{timestamp}.pt'))
+
+            continue
 
         
         fids, train_losses, val_losses = train(args.epochs, train_loader, val_loader, test_dataset, model, optimizer, diffusion, device, loss_fn, args.v, args.eval_method, args.eval_steps, args.eval_samples, batch_size)
