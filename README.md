@@ -12,7 +12,7 @@ As appreciated, it is possible to give a single parameter or a set of parameters
 
 ### Evaluation
 
-If evaluation is indicated, then the performance of the model will be calculated every eval-steps using given eval-samples based on the given measurement (currently only FID is supprted) <cite>[Maximilian Seitzer][1]</cite>
+If evaluation is indicated, then the performance of the model will be calculated every eval-steps using given eval-samples based on the given measurement (currently only FID is supprted). [<cite>[Maximilian Seitzer][1]</cite>]
 
 [1]: https://github.com/mseitzer/pytorch-fid
 
